@@ -381,50 +381,143 @@ impl SpinWait {
 }
 
 use std::{
+    cell::Cell,
     ptr::NonNull,
-    collections::{HashMap, VecDeque},
+    convert::TryInto,
+    sync::atomic::AtomicUsize,
 };
 
+const WAIT_UNLOCKED: usize = 0;
+const WAIT_LOCKED: usize = 1;
+const WAIT_CONTENDED: usize = 2;
+const WAIT_STATE: usize = WAIT_LOCKED | WAIT_CONTENDED;
+const WAIT_QUEUE: usize = !WAIT_STATE;
+
+#[repr(align(4))]
 struct Waiter {
+    addr: u32,
     token: u32,
     futex: AtomicU32,
+    next: Cell<Option<NonNull<Self>>>,
+    tail: Cell<Option<NonNull<Self>>>,
+    addr_prev: Cell<Option<NonNull<Self>>>,
+    addr_next: Cell<Option<NonNull<Self>>>,
 }
 
-type WaitQueueInner = HashMap<u32, VecDeque<NonNull<Waiter>>>;
+type WaitQueueInner = Option<NonNull<Waiter>>;
 
 struct WaitQueue {
-    mutex: Mutex,
-    queue: UnsafeCell<WaitQueueInner>,
+    state: AtomicUsize,
 }
 
 impl WaitQueue {
     fn new() -> Self {
         Self {
-            mutex: Mutex::new(),
-            queue: UnsafeCell::new(WaitQueueInner::new()),
+            state: AtomicUsize::new(WAIT_UNLOCKED),
         }
     }
 
     fn with_queue<T>(&self, f: impl FnOnce(&mut WaitQueueInner) -> T) -> T {
-        self.mutex.lock();
-        let result = f(unsafe { &mut *self.queue.get() });
-        self.mutex.unlock();
+        let mut queue = self.acquire();
+        let result = f(&mut queue);
+        self.release(queue);
         result
+    }
+
+    fn acquire(&self) -> Option<NonNull<Waiter>> {
+        let mut spin = SpinWait::new();
+        let mut acquire_with = WAIT_LOCKED;
+        let mut state = self.state.load(Ordering::Relaxed);
+
+        loop {
+            if state & WAIT_STATE == WAIT_UNLOCKED {
+                match self.state.compare_exchange_weak(
+                    state,
+                    (state & WAIT_QUEUE) | acquire_with,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return NonNull::new((state & WAIT_QUEUE) as *mut Waiter),
+                    Err(e) => state = e,
+                }
+                continue;
+            }
+
+            if state & WAIT_STATE == WAIT_LOCKED {
+                if spin.yield_now() {
+                    state = self.state.load(Ordering::Relaxed);
+                    continue;
+                }
+
+                if let Err(e) = self.state.compare_exchange_weak(
+                    state,
+                    (state & WAIT_QUEUE) | WAIT_CONTENDED,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    state = e;
+                    continue;
+                }
+            }
+
+            Futex::wait(
+                unsafe { &*(&self.state as *const _ as *const AtomicU32) },
+                (((state & WAIT_QUEUE) | WAIT_CONTENDED) & 0xffffffff).try_into().unwrap(),
+            );
+
+            spin.reset();
+            acquire_with = WAIT_CONTENDED;
+            state = self.state.load(Ordering::Relaxed);
+        }
+    }
+
+    fn release(&self, queue: Option<NonNull<Waiter>>) {
+        let new_state = queue.map(|w| w.as_ptr() as usize).unwrap_or(0);
+        let old_state = self.state.swap(new_state, Ordering::Release);
+
+        if old_state & WAIT_STATE == WAIT_CONTENDED {
+            Futex::wake(
+                unsafe { &*(&self.state as *const _ as *const AtomicU32) },
+                1,
+            );
+        }
     }
 
     fn wait(&self, addr: u32, token: u32, validate: impl FnOnce() -> bool) {
         let waiter = Waiter {
+            addr,
             token,
             futex: AtomicU32::new(0),
+            next: Cell::new(None),
+            tail: Cell::new(None),
+            addr_prev: Cell::new(None),
+            addr_next: Cell::new(None),
         };
 
-        if self.with_queue(|queue: &mut WaitQueueInner| {
+        if self.with_queue(|queue: &mut WaitQueueInner| unsafe {
             if !validate() {
                 return false;
             }
-            
-            let wqueue = queue.entry(addr).or_insert(VecDeque::new());
-            wqueue.push_back(NonNull::from(&waiter));
+
+            let mut head = *queue;
+            while let Some(h) = head {
+                if h.as_ref().addr == addr { break; }
+                waiter.addr_prev.set(Some(h));
+                head = h.as_ref().addr_next.get();
+            }
+
+            if let Some(h) = head {
+                let tail = h.as_ref().tail.get().unwrap();
+                tail.as_ref().next.set(Some(NonNull::from(&waiter)));
+                h.as_ref().tail.set(Some(NonNull::from(&waiter)));
+            } else if let Some(addr_prev) = waiter.addr_prev.get() {
+                addr_prev.as_ref().addr_next.set(Some(NonNull::from(&waiter)));
+                waiter.tail.set(Some(NonNull::from(&waiter)));
+            } else {
+                *queue = Some(NonNull::from(&waiter));
+                waiter.tail.set(Some(NonNull::from(&waiter)));
+            }
+
             true
         }) {
             while waiter.futex.load(Ordering::Acquire) == 0 {
@@ -434,28 +527,49 @@ impl WaitQueue {
     }
 
     fn wake(&self, addr: u32, mut filter: impl FnMut(u32) -> bool, awoken: impl FnOnce(bool)) {
-        let notified = self.with_queue(|queue: &mut WaitQueueInner| unsafe {
-            let mut notified = Vec::new();
+        let mut notified = self.with_queue(|queue: &mut WaitQueueInner| unsafe {
+            let mut notified = None;
             
-            let mut has_more = false;
-            if let Some(wqueue) = queue.get_mut(&addr) {
-                while let Some(waiter) = wqueue.pop_front() {
-                    if filter(waiter.as_ref().token) {
-                        notified.push(waiter);
-                    } else {
-                        wqueue.push_front(waiter);
-                        break;
-                    }
-                }
-                has_more = wqueue.len() > 0;
+            let mut head = *queue;
+            while let Some(h) = head {
+                if h.as_ref().addr == addr { break; }
+                head = h.as_ref().addr_next.get();
             }
 
-            awoken(has_more);
+            while let Some(waiter) = head {
+                if !filter(waiter.as_ref().token) {
+                    break;
+                }
+
+                head = waiter.as_ref().next.get();
+                if let Some(new_head) = head {
+                    new_head.as_ref().tail.set(waiter.as_ref().tail.get());
+                    new_head.as_ref().addr_prev.set(waiter.as_ref().addr_prev.get());
+                    new_head.as_ref().addr_next.set(waiter.as_ref().addr_next.get());
+                }
+
+                let next = waiter.as_ref().addr_next.get();
+                let prev = waiter.as_ref().addr_prev.get();
+                if let Some(addr_next) = next {
+                    addr_next.as_ref().addr_prev.set(head.or(prev));
+                }
+                if let Some(addr_prev) = prev {
+                    addr_prev.as_ref().addr_next.set(head.or(next));
+                } else {
+                    *queue = head.or(next);
+                }
+
+                waiter.as_ref().next.set(notified);
+                notified = Some(waiter);
+            }
+
+            awoken(head.is_some());
             notified
         });
 
-        for waiter in notified.into_iter() {
+        while let Some(waiter) = notified {
             let waiter = unsafe { waiter.as_ref() };
+            notified = waiter.next.get();
             waiter.futex.store(1, Ordering::Release);
             Futex::wake(&waiter.futex, 1);
         }

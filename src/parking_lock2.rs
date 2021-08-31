@@ -381,16 +381,21 @@ impl SpinWait {
 }
 
 use std::{
+    cell::Cell,
     ptr::NonNull,
-    collections::{HashMap, VecDeque},
 };
 
 struct Waiter {
     token: u32,
     futex: AtomicU32,
+    next: Cell<Option<NonNull<Self>>>,
+    tail: Cell<Option<NonNull<Self>>>,
 }
 
-type WaitQueueInner = HashMap<u32, VecDeque<NonNull<Waiter>>>;
+struct WaitQueueInner {
+    parked: Option<NonNull<Waiter>>,
+    writer: Option<NonNull<Waiter>>,
+}
 
 struct WaitQueue {
     mutex: Mutex,
@@ -401,7 +406,10 @@ impl WaitQueue {
     fn new() -> Self {
         Self {
             mutex: Mutex::new(),
-            queue: UnsafeCell::new(WaitQueueInner::new()),
+            queue: UnsafeCell::new(WaitQueueInner {
+                parked: None,
+                writer: None,
+            }),
         }
     }
 
@@ -416,15 +424,30 @@ impl WaitQueue {
         let waiter = Waiter {
             token,
             futex: AtomicU32::new(0),
+            next: Cell::new(None),
+            tail: Cell::new(None),
         };
 
-        if self.with_queue(|queue: &mut WaitQueueInner| {
+        if self.with_queue(|queue: &mut WaitQueueInner| unsafe {
             if !validate() {
                 return false;
             }
+
+            let head = match addr {
+                PARKED => &mut queue.parked,
+                WRITER_PARKED => &mut queue.writer,
+                _ => unreachable!(),
+            };
             
-            let wqueue = queue.entry(addr).or_insert(VecDeque::new());
-            wqueue.push_back(NonNull::from(&waiter));
+            if let Some(head) = *head {
+                let tail = head.as_ref().tail.get().unwrap();
+                tail.as_ref().next.set(Some(NonNull::from(&waiter)));
+                head.as_ref().tail.set(Some(NonNull::from(&waiter)));
+            } else {
+                waiter.tail.set(Some(NonNull::from(&waiter)));
+                *head = Some(NonNull::from(&waiter));
+            }
+
             true
         }) {
             while waiter.futex.load(Ordering::Acquire) == 0 {
@@ -434,28 +457,36 @@ impl WaitQueue {
     }
 
     fn wake(&self, addr: u32, mut filter: impl FnMut(u32) -> bool, awoken: impl FnOnce(bool)) {
-        let notified = self.with_queue(|queue: &mut WaitQueueInner| unsafe {
-            let mut notified = Vec::new();
+        let mut notified = self.with_queue(|queue: &mut WaitQueueInner| unsafe {
+            let mut notified = None;
             
-            let mut has_more = false;
-            if let Some(wqueue) = queue.get_mut(&addr) {
-                while let Some(waiter) = wqueue.pop_front() {
-                    if filter(waiter.as_ref().token) {
-                        notified.push(waiter);
-                    } else {
-                        wqueue.push_front(waiter);
-                        break;
-                    }
+            let head = match addr {
+                PARKED => &mut queue.parked,
+                WRITER_PARKED => &mut queue.writer,
+                _ => unreachable!(),
+            };
+
+            while let Some(waiter) = *head {
+                if !filter(waiter.as_ref().token) {
+                    break;
                 }
-                has_more = wqueue.len() > 0;
+
+                *head = waiter.as_ref().next.get();
+                if let Some(new_head) = *head {
+                    new_head.as_ref().tail.set(waiter.as_ref().tail.get());
+                }
+
+                waiter.as_ref().next.set(notified);
+                notified = Some(waiter);
             }
 
-            awoken(has_more);
+            awoken(head.is_some());
             notified
         });
 
-        for waiter in notified.into_iter() {
+        while let Some(waiter) = notified {
             let waiter = unsafe { waiter.as_ref() };
+            notified = waiter.next.get();
             waiter.futex.store(1, Ordering::Release);
             Futex::wake(&waiter.futex, 1);
         }
