@@ -1,19 +1,46 @@
 use std::{
-    cell::UnsafeCell,
+    hint::spin_loop,
+    ptr::{self, NonNull},
+    cell::{Cell, UnsafeCell},
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, AtomicPtr, fence, Ordering},
 };
 
-const UNLOCKED: u32 = 0;
-const WRITER: u32 = 0b0001;
-const PARKED: u32 = 0b0010;
-const WRITER_PARKED: u32 = 0b0100;
-const READER: u32 = 0b01000;
-const READER_MASK: u32 = !(READER - 1);
+const UNLOCKED: usize = 0;
+const LOCKED: usize = 1;
+const QUEUED: usize = 2;
+const READING: usize = 4;
+
+const READER_SHIFT: u32 = 8usize.trailing_zeros();
+const WAITER_MASK: usize = !((1 << READER_SHIFT) - 1);
+
+#[repr(align(8))]
+#[derive(Default)]
+struct Waiter {
+    next: Cell<Option<NonNull<Self>>>,
+    prev: AtomicWaiterCell,
+    tail: AtomicWaiterCell,
+    is_writer: Cell<bool>,
+    readers: AtomicUsize,
+    event: ResetEvent,
+}
+
+#[derive(Default)]
+struct AtomicWaiterCell(AtomicPtr<Waiter>);
+
+impl AtomicWaiterCell {
+    fn set(&self, p: Option<NonNull<Waiter>>) {
+        let p = p.map(|p| p.as_ptr()).unwrap_or(ptr::null_mut());
+        self.0.store(p, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> Option<NonNull<Waiter>> {
+        NonNull::new(self.0.load(Ordering::Relaxed))
+    }
+}
 
 pub struct RwLock<T> {
-    state: AtomicU32,
-    queue: WaitQueue,
+    state: AtomicUsize,
     value: UnsafeCell<T>,
 }
 
@@ -23,76 +50,44 @@ unsafe impl<T: Send> Sync for RwLock<T> {}
 impl<T> RwLock<T> {
     pub fn new(value: T) -> Self {
         Self {
-            state: AtomicU32::new(UNLOCKED),
-            queue: WaitQueue::new(),
+            state: AtomicUsize::new(UNLOCKED),
             value: UnsafeCell::new(value),
         }
     }
 
     #[inline]
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
-        if let Err(_) = self.state.compare_exchange_weak(
-            UNLOCKED,
-            WRITER,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
+        if !self.write_fast() {
             self.write_slow();
         }
+
         RwLockWriteGuard(self)
+    }
+
+    #[inline(always)]
+    fn write_fast(&self) -> bool {
+        self.state
+            .compare_exchange_weak(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
     }
 
     #[cold]
     fn write_slow(&self) {
-        self.acquire(
-            WRITER,
-            PARKED,
-            || {
-                let mut state = self.state.load(Ordering::Relaxed);
-                while state & WRITER == 0 {
-                    state = match self.state.compare_exchange_weak(
-                        state,
-                        state | WRITER,
-                        Ordering::Acquire,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => return None,
-                        Err(e) => e,
-                    };
-                }
-                return Some(state);
-            },
-            |state| {
-                state & (WRITER | PARKED) == (WRITER | PARKED)
+        let try_acquire = |state: usize| {
+            match state & LOCKED {
+                0 => Some(state | LOCKED),
+                _ => None,
             }
-        );
+        };
 
-        self.acquire(
-            WRITER,
-            WRITER_PARKED,
-            || {
-                let state = self.state.load(Ordering::Acquire);
-                assert!(state & WRITER != 0);
-                match state & READER_MASK {
-                    0 => None,
-                    _ => Some(state)
-                }
-            },
-            |state| {
-                assert!(state & WRITER != 0);
-                if state & READER_MASK == 0 {
-                    return false;
-                }
-                assert!(state & WRITER_PARKED != 0);
-                true
-            },
-        );
+        let is_writer = true;
+        self.lock(is_writer, try_acquire);
     }
 
     #[inline]
     pub unsafe fn force_unlock_write(&self) {
         if let Err(_) = self.state.compare_exchange(
-            WRITER,
+            LOCKED,
             UNLOCKED,
             Ordering::Release,
             Ordering::Relaxed,
@@ -102,11 +97,8 @@ impl<T> RwLock<T> {
     }
 
     #[cold]
-    fn unlock_write_slow(&self) {
-        self.notify(PARKED, |has_more| {
-            let new_state = if has_more { PARKED } else { UNLOCKED };
-            self.state.store(new_state, Ordering::Release);
-        })
+    unsafe fn unlock_write_slow(&self) {
+        self.unlock_and_wake();
     }
 
     #[inline]
@@ -118,122 +110,210 @@ impl<T> RwLock<T> {
         RwLockReadGuard(self)
     }
 
-    #[inline]
+    #[inline(always)]
+    fn try_acquire_reader(state: usize) -> Option<usize> {
+        if (state == UNLOCKED) || (state & (LOCKED | QUEUED | READING) == (LOCKED | READING)) {
+            (state | LOCKED | READING).checked_add(1 << READER_SHIFT)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
     fn read_fast(&self) -> bool {
         let state = self.state.load(Ordering::Relaxed);
-        if state & WRITER != 0 {
-            return false;
+
+        if let Some(new_state) = Self::try_acquire_reader(state) {
+            return self
+                .state
+                .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok();
         }
 
-        let new_state = match state.checked_add(READER) {
-            Some(s) => s,
-            None => return false,
-        };
-
-        self.state.compare_exchange_weak(
-            state,
-            new_state,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ).is_ok()
+        false
     }
 
     #[cold]
     fn read_slow(&self) {
-        self.acquire(
-            READER,
-            PARKED,
-            || {
-                let mut spin = SpinWait::new();
-                loop {
-                    let state = self.state.load(Ordering::Relaxed);
-                    if state & WRITER != 0 {
-                        return Some(state);
-                    }
-
-                    let new_state = state.checked_add(READER)
-                        .expect("reader count overflowed");
-
-                    match self.state.compare_exchange_weak(
-                        state,
-                        new_state,
-                        Ordering::Acquire,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => return None,
-                        Err(_) => spin.force_yield(),
-                    }
-                }
-            },
-            |state| {
-                state & (WRITER | PARKED) == (WRITER | PARKED)
-            },
-        );
+        let is_writer = false;
+        self.lock(is_writer, Self::try_acquire_reader);
     }
 
     #[inline]
     pub unsafe fn force_unlock_read(&self) {
-        let state = self.state.fetch_sub(READER, Ordering::Release);
-        assert!(state >= READER);
+        let mut state = self.state.load(Ordering::Relaxed);
 
-        if state & (READER_MASK | WRITER_PARKED) == (READER | WRITER_PARKED) {
-            self.unlock_read_slow();
+        if state == (LOCKED | READING | (1 << READER_SHIFT)) {
+            match self.state.compare_exchange_weak(
+                state,
+                UNLOCKED,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(e) => state = e,
+            }
+        }
+
+        self.unlock_read_slow(state);
+    }
+
+    #[cold]
+    unsafe fn unlock_read_slow(&self, mut state: usize) {
+        while state & QUEUED == 0 {
+            assert_ne!(state & LOCKED, 0);
+            assert_ne!(state & READING, 0);
+            assert_ne!(state >> READER_SHIFT, 0);
+
+            let mut new_state = state - (1 << READER_SHIFT);
+            if new_state == (LOCKED | READING) {
+                new_state = UNLOCKED;
+            }
+
+            match self.state.compare_exchange_weak(
+                state,
+                new_state,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(e) => state = e,
+            }
+        }
+
+        assert_ne!(state & LOCKED, 0);
+        assert_ne!(state & READING, 0);
+        assert_ne!(state & QUEUED, 0);
+
+        fence(Ordering::Acquire);
+        let (_, tail) = self.get_and_link_queue(state);
+
+        let readers = tail.as_ref().readers.fetch_sub(1, Ordering::Release);
+        assert_ne!(readers, 0);
+
+        if readers == 1 {
+            self.unlock_and_wake();
         }
     }
 
-    #[cold]
-    fn unlock_read_slow(&self) {
-        self.state.fetch_and(!WRITER_PARKED, Ordering::Relaxed);
-        self.notify(WRITER_PARKED, |has_more| {
-            assert!(!has_more);
-        });
-    }
+    fn lock(&self, is_writer: bool, mut try_acquire: impl FnMut(usize) -> Option<usize>) {
+        let mut spin = 0;
+        let waiter = Waiter::default();
+        let mut state = self.state.load(Ordering::Relaxed);
 
-    #[cold]
-    fn acquire(&self, token: u32, addr: u32, try_lock: impl Fn() -> Option<u32>, should_wait: impl Fn(u32) -> bool) {
-        let mut spin = SpinWait::new();
         loop {
-            let state = match try_lock() {
-                None => return,
-                Some(s) => s,
-            };
-
-            if state & addr == 0 {
-                if spin.yield_now() {
-                    continue;
-                }
-
-                if let Err(_) = self.state.compare_exchange_weak(
+            let mut backoff = 0;
+            while let Some(new_state) = try_acquire(state) {
+                if let Ok(_) = self.state.compare_exchange_weak(
                     state,
-                    state | addr,
-                    Ordering::Relaxed,
+                    new_state,
+                    Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
-                    spin.force_yield();
-                    continue;
+                    return;
                 }
+
+                backoff = (backoff << 1).min(32);
+                (0..backoff).for_each(|_| spin_loop());
+                state = self.state.load(Ordering::Relaxed);
+            }
+
+            if (state & QUEUED == 0) && (spin < 100) {
+                spin += 1;
+                std::hint::spin_loop();
+                state = self.state.load(Ordering::Relaxed);
+                continue;
+            }
+
+            waiter.is_writer.set(is_writer);
+            waiter.event.reset();
+            waiter.prev.set(None);
+            waiter.next.set(None);
+            waiter.tail.set(None);
+
+            let waiter_ptr = &waiter as *const Waiter as usize;
+            let new_state = (state & !WAITER_MASK) | waiter_ptr | QUEUED;
+
+            if state & QUEUED == 0 {
+                waiter.readers.store(state >> READER_SHIFT, Ordering::Relaxed);
+                waiter.tail.set(Some(NonNull::from(&waiter)));
+            } else {
+                waiter.next.set(NonNull::new((state & WAITER_MASK) as *mut Waiter));
+            }
+
+            if let Err(e) = self.state.compare_exchange_weak(
+                state,
+                new_state,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                state = e;
+                continue;
             }
             
-            spin.reset();
-            self.queue.wait(addr, token, || {
-                let state = self.state.load(Ordering::Relaxed);
-                should_wait(state)
-            });
+            spin = 0;
+            waiter.event.wait();
+            state = self.state.load(Ordering::Relaxed);
         }
     }
 
-    #[cold]
-    fn notify(&self, addr: u32, on_notify: impl FnOnce(bool)) {
-        let mut saw_writer = false;
-        let filter = |token| {
-            if saw_writer {
-                return false;
+    unsafe fn unlock_and_wake(&self) {
+        let mut state = self.state.load(Ordering::Acquire);
+        let tail = loop {
+            assert_ne!(state & LOCKED, 0);
+            assert_ne!(state & QUEUED, 0);
+
+            let (head, tail) = self.get_and_link_queue(state);
+
+            if tail.as_ref().is_writer.get() {
+                if let Some(new_tail) = tail.as_ref().prev.get() {
+                    head.as_ref().tail.set(Some(new_tail));
+                    self.state.fetch_and(!(LOCKED | READING), Ordering::Release);
+
+                    tail.as_ref().prev.set(None);
+                    break tail;
+                }
             }
 
-            saw_writer = token == WRITER;
-            return true;
+            match self.state.compare_exchange_weak(
+                state,
+                UNLOCKED,
+                Ordering::AcqRel, // could be Release
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break tail,
+                Err(e) => state = e,
+            }
         };
-        self.queue.wake(addr, filter, on_notify);
+
+        let mut wake = Some(tail);
+        while let Some(waiter) = wake {
+            wake = waiter.as_ref().prev.get();
+            waiter.as_ref().event.set();
+        }
+    }
+
+    unsafe fn get_and_link_queue(&self, state: usize) -> (NonNull<Waiter>, NonNull<Waiter>) {
+        let head = NonNull::new((state & WAITER_MASK) as *mut Waiter);
+        let head = head.expect("wait queue with invalid head");
+
+        let tail = head.as_ref().tail.get().unwrap_or_else(|| {
+            let mut current = head;
+            loop {
+                let next = current.as_ref().next.get();
+                let next = next.expect("waiter with unreachable tail");
+
+                next.as_ref().prev.set(Some(current));
+                current = next;
+
+                if let Some(tail) = current.as_ref().tail.get() {
+                    head.as_ref().tail.set(Some(tail));
+                    return tail;
+                }
+            }
+        });
+
+        (head, tail)
     }
 }
 
@@ -272,6 +352,38 @@ impl<'a, T> Deref for RwLockWriteGuard<'a, T> {
 
     fn deref(&self) -> &T {
         unsafe { &*self.0.value.get() }
+    }
+}
+
+#[derive(Default)]
+struct ResetEvent {
+    state: AtomicU32,
+}
+
+impl ResetEvent {
+    fn reset(&self) {
+        self.state.store(0, Ordering::Relaxed);
+    }
+
+    fn wait(&self) {
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+            .is_ok()
+        {
+            loop {
+                Futex::wait(&self.state, 1);
+                if self.state.load(Ordering::Acquire) == 2 {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn set(&self) {
+        if self.state.swap(2, Ordering::Release) == 1 {
+            Futex::wake(&self.state, 1);
+        }
     }
 }
 
@@ -336,229 +448,3 @@ impl Futex {
     }
 }
 
-struct SpinWait {
-    count: usize,
-}
-
-#[allow(unused, deprecated)]
-impl SpinWait {
-    const fn new() -> Self {
-        Self { count: 0 }
-    }
-
-    fn reset(&mut self) {
-        self.count = 0;
-    }
-
-    fn yield_now(&mut self) -> bool {
-        if self.count >= 100 { return false; }
-        self.count += 1;
-        std::sync::atomic::spin_loop_hint();
-        true
-    }
-
-    fn force_yield(&mut self) {
-        let _ = self.yield_now() || {
-            // std::thread::yield_now();
-            std::sync::atomic::spin_loop_hint();
-            true
-        };
-    }
-}
-
-use std::{
-    cell::Cell,
-    ptr::NonNull,
-    convert::TryInto,
-    sync::atomic::AtomicUsize,
-};
-
-const WAIT_UNLOCKED: usize = 0;
-const WAIT_LOCKED: usize = 1;
-const WAIT_CONTENDED: usize = 2;
-const WAIT_STATE: usize = WAIT_LOCKED | WAIT_CONTENDED;
-const WAIT_QUEUE: usize = !WAIT_STATE;
-
-#[repr(align(4))]
-struct Waiter {
-    addr: u32,
-    token: u32,
-    futex: AtomicU32,
-    next: Cell<Option<NonNull<Self>>>,
-    tail: Cell<Option<NonNull<Self>>>,
-    addr_prev: Cell<Option<NonNull<Self>>>,
-    addr_next: Cell<Option<NonNull<Self>>>,
-}
-
-type WaitQueueInner = Option<NonNull<Waiter>>;
-
-#[repr(align(128))]
-struct WaitQueue {
-    state: AtomicUsize,
-}
-
-impl WaitQueue {
-    fn new() -> Self {
-        Self {
-            state: AtomicUsize::new(WAIT_UNLOCKED),
-        }
-    }
-
-    fn with_queue<T>(&self, f: impl FnOnce(&mut WaitQueueInner) -> T) -> T {
-        let mut queue = self.acquire();
-        let result = f(&mut queue);
-        self.release(queue);
-        result
-    }
-
-    fn acquire(&self) -> Option<NonNull<Waiter>> {
-        let mut spin = SpinWait::new();
-        let mut acquire_with = WAIT_LOCKED;
-        let mut state = self.state.load(Ordering::Relaxed);
-
-        loop {
-            if state & WAIT_STATE == WAIT_UNLOCKED {
-                match self.state.compare_exchange_weak(
-                    state,
-                    (state & WAIT_QUEUE) | acquire_with,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return NonNull::new((state & WAIT_QUEUE) as *mut Waiter),
-                    Err(e) => state = e,
-                }
-                continue;
-            }
-
-            if state & WAIT_STATE == WAIT_LOCKED {
-                if spin.yield_now() {
-                    state = self.state.load(Ordering::Relaxed);
-                    continue;
-                }
-
-                if let Err(e) = self.state.compare_exchange_weak(
-                    state,
-                    (state & WAIT_QUEUE) | WAIT_CONTENDED,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    state = e;
-                    continue;
-                }
-            }
-
-            Futex::wait(
-                unsafe { &*(&self.state as *const _ as *const AtomicU32) },
-                (((state & WAIT_QUEUE) | WAIT_CONTENDED) & 0xffffffff).try_into().unwrap(),
-            );
-
-            spin.reset();
-            acquire_with = WAIT_CONTENDED;
-            state = self.state.load(Ordering::Relaxed);
-        }
-    }
-
-    fn release(&self, queue: Option<NonNull<Waiter>>) {
-        let new_state = queue.map(|w| w.as_ptr() as usize).unwrap_or(0);
-        let old_state = self.state.swap(new_state, Ordering::Release);
-
-        if old_state & WAIT_STATE == WAIT_CONTENDED {
-            Futex::wake(
-                unsafe { &*(&self.state as *const _ as *const AtomicU32) },
-                1,
-            );
-        }
-    }
-
-    fn wait(&self, addr: u32, token: u32, validate: impl FnOnce() -> bool) {
-        let waiter = Waiter {
-            addr,
-            token,
-            futex: AtomicU32::new(0),
-            next: Cell::new(None),
-            tail: Cell::new(None),
-            addr_prev: Cell::new(None),
-            addr_next: Cell::new(None),
-        };
-
-        if self.with_queue(|queue: &mut WaitQueueInner| unsafe {
-            if !validate() {
-                return false;
-            }
-
-            let mut head = *queue;
-            while let Some(h) = head {
-                if h.as_ref().addr == addr { break; }
-                waiter.addr_prev.set(Some(h));
-                head = h.as_ref().addr_next.get();
-            }
-
-            if let Some(h) = head {
-                let tail = h.as_ref().tail.get().unwrap();
-                tail.as_ref().next.set(Some(NonNull::from(&waiter)));
-                h.as_ref().tail.set(Some(NonNull::from(&waiter)));
-            } else if let Some(addr_prev) = waiter.addr_prev.get() {
-                addr_prev.as_ref().addr_next.set(Some(NonNull::from(&waiter)));
-                waiter.tail.set(Some(NonNull::from(&waiter)));
-            } else {
-                *queue = Some(NonNull::from(&waiter));
-                waiter.tail.set(Some(NonNull::from(&waiter)));
-            }
-
-            true
-        }) {
-            while waiter.futex.load(Ordering::Acquire) == 0 {
-                Futex::wait(&waiter.futex, 0);
-            }
-        }
-    }
-
-    fn wake(&self, addr: u32, mut filter: impl FnMut(u32) -> bool, awoken: impl FnOnce(bool)) {
-        let mut notified = self.with_queue(|queue: &mut WaitQueueInner| unsafe {
-            let mut notified = None;
-            
-            let mut head = *queue;
-            while let Some(h) = head {
-                if h.as_ref().addr == addr { break; }
-                head = h.as_ref().addr_next.get();
-            }
-
-            while let Some(waiter) = head {
-                if !filter(waiter.as_ref().token) {
-                    break;
-                }
-
-                head = waiter.as_ref().next.get();
-                if let Some(new_head) = head {
-                    new_head.as_ref().tail.set(waiter.as_ref().tail.get());
-                    new_head.as_ref().addr_prev.set(waiter.as_ref().addr_prev.get());
-                    new_head.as_ref().addr_next.set(waiter.as_ref().addr_next.get());
-                }
-
-                let next = waiter.as_ref().addr_next.get();
-                let prev = waiter.as_ref().addr_prev.get();
-                if let Some(addr_next) = next {
-                    addr_next.as_ref().addr_prev.set(head.or(prev));
-                }
-                if let Some(addr_prev) = prev {
-                    addr_prev.as_ref().addr_next.set(head.or(next));
-                } else {
-                    *queue = head.or(next);
-                }
-
-                waiter.as_ref().next.set(notified);
-                notified = Some(waiter);
-            }
-
-            awoken(head.is_some());
-            notified
-        });
-
-        while let Some(waiter) = notified {
-            let waiter = unsafe { waiter.as_ref() };
-            notified = waiter.next.get();
-            waiter.futex.store(1, Ordering::Release);
-            Futex::wake(&waiter.futex, 1);
-        }
-    }
-}
